@@ -1,5 +1,5 @@
 """RankTracker Lite: same-origin SerpAPI proxy, Python standard library."""
-import json, os, re, hashlib
+import json, os, re, hashlib, time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode, urlsplit, parse_qs
@@ -21,7 +21,9 @@ def upstream(path,params):
         try: msg=json.loads(e.read()).get('error','HTTP '+str(e.code))
         except Exception: msg='HTTP '+str(e.code)
         raise APIError(clean(msg),e.code)
-    except (TimeoutError,URLError,ValueError): raise APIError('SerpAPI timed out or returned invalid JSON. Retry later.',504)
+    except TimeoutError: raise APIError('SerpAPI request timed out. Try Web-only search or retry later.',504)
+    except URLError: raise APIError('Backend could not connect to SerpAPI. Retry later.',502)
+    except ValueError: raise APIError('SerpAPI returned invalid JSON. Retry later.',502)
     if not isinstance(data,dict): raise APIError('Unexpected API response.')
     if data.get('error'): raise APIError(clean(data['error']))
     if path=='search.json' and (data.get('search_metadata') or {}).get('status') not in ('Success',None):
@@ -52,7 +54,8 @@ def page(p):
     if not keyword or country not in COUNTRIES or device not in ('desktop','mobile') or type(offset) is not int or offset not in range(0,100,10): raise ValueError('Invalid search settings.')
     name,google=COUNTRIES[country]
     params={'engine':'google','q':keyword,'api_key':key,'gl':country,'google_domain':google,'hl':'en','device':device,'start':offset}
-    params['location']=(location if location.lower().endswith(name.lower()) else location+', '+name) if location else name
+    if location: params['location']=location if location.lower().endswith(name.lower()) else location+', '+name
+    requested_location=params.get('location',name+' (country targeting)')
     if p.get('web') is True: params['udm']='web'
     if p.get('fresh') is True: params['no_cache']='true'
     data=upstream('search.json',params)
@@ -78,10 +81,14 @@ def page(p):
             n=int(parse_qs(urlsplit(nxt).query)['start'][0]); next_offset=n if n>offset and n in range(0,100,10) else None
         except (ValueError,KeyError,TypeError): pass
     if next_offset is None and len(items)>=10 and offset<90: next_offset=offset+10
-    return {'state':'ok','match':matches[0] if matches else None,'scanned':scanned,'count':len(items),'next_offset':next_offset,'search_id':sid,'signature':hashlib.sha256(json.dumps(links).encode()).hexdigest(),'location':(data.get('search_parameters') or {}).get('location_used',params['location'])}
+    return {'state':'ok','match':matches[0] if matches else None,'scanned':scanned,'count':len(items),'next_offset':next_offset,'search_id':sid,'signature':hashlib.sha256(json.dumps(links).encode()).hexdigest(),'location':(data.get('search_parameters') or {}).get('location_used',requested_location)}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
+    def log_request(self,code='-',size='-'):
+        route=urlsplit(self.path).path
+        if route in ('/','/health','/api/account','/api/page'):
+            print(f'HTTP {self.command} {route} {code}',flush=True)
     def send(self,obj,status=200,html=False):
         b=obj if html else json.dumps(obj,ensure_ascii=False).encode()
         self.send_response(status)
@@ -90,14 +97,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','no-referrer')
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-        self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)
+        self.send_header('Content-Length',str(len(b))); self.end_headers()
+        if self.command!='HEAD': self.wfile.write(b)
     def do_GET(self):
-        if self.path=='/': self.send((ROOT/'index.html').read_bytes(),html=True)
-        elif self.path=='/health': self.send({'ok':True})
+        route=urlsplit(self.path).path
+        if route=='/': self.send((ROOT/'index.html').read_bytes(),html=True)
+        elif route=='/health': self.send({'ok':True,'version':'2.1','backend':'ready'})
         else: self.send({'error':'Not found'},404)
+    def do_HEAD(self): self.do_GET()
     def do_POST(self):
         origin=self.headers.get('Origin','')
-        if (origin and urlsplit(origin).netloc!=self.headers.get('Host','')) or self.headers.get('Content-Type','').split(';')[0]!='application/json':
+        allowed={self.headers.get('Host','').lower(),os.environ.get('RENDER_EXTERNAL_HOSTNAME','').lower(),urlsplit(os.environ.get('RENDER_EXTERNAL_URL','')).netloc.lower()}
+        allowed.discard('')
+        if (origin and urlsplit(origin).netloc.lower() not in allowed) or self.headers.get('Content-Type','').split(';')[0].strip().lower()!='application/json':
             return self.send({'error':'Use the tool from its own website.'},403)
         try:
             size=int(self.headers.get('Content-Length','0'))
@@ -108,9 +120,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/api/page': return self.send(page(p))
             return self.send({'error':'Not found'},404)
         except (ValueError,TypeError,KeyError) as e: self.send({'error':str(e)},400)
-        except APIError as e: self.send({'error':str(e)},e.code if 400<=e.code<=599 else 502)
+        except APIError as e:
+            print(f'SerpAPI {urlsplit(self.path).path} failed: HTTP {e.code}',flush=True)
+            self.send({'error':str(e),'source':'SerpAPI'},e.code if 400<=e.code<=599 else 502)
         except (BrokenPipeError,ConnectionResetError): pass
-        except Exception: self.send({'error':'Unexpected server error.'},500)
+        except Exception as e:
+            print(f'Backend {urlsplit(self.path).path} failed: {type(e).__name__}',flush=True)
+            self.send({'error':'Unexpected server error. See Render logs.'},500)
 
 if __name__=='__main__':
     cloud='PORT' in os.environ; port=int(os.environ.get('PORT','8765'))
